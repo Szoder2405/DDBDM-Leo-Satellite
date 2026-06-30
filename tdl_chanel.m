@@ -1,0 +1,360 @@
+clear all; 
+clearvars all;
+close all;
+%% Parámetros
+T_CP=1.48124e-6;
+
+M = 64;          % number of subcarriers
+N = 30;          % number of subsymbols/frame
+df = 15e3;       % make this the frequency bin spacing of LTE
+fc = 5e9;        % carrier frequency in Hz
+padLen = 10;     % make this larger than the channel delay spread channel in samples
+padType = 'ZP';  % this example requires ZP for ISI mitigation
+SNRdB = 40;
+
+fsamp = M*df;            % sampling frequency
+Meff = M + padLen;       % samples per OTFS subsymbol
+numSamps = Meff * N;     % samples per OTFS symbol
+T = ((M+padLen)/(M*df)); % symbol time (seconds)
+
+
+% Pilot generation and grid population
+pilotBin = floor(N/2)+1;
+Pdd = zeros(M,N);
+Pdd(1,pilotBin) = exp(1i*pi/4); % populate just one bin to see the effect through the channel
+
+% OTFS modulation (tu helper debe estar en path)
+txOut = helperOTFSmod(Pdd,padLen,padType);
+
+% --- TDL channel parameters que pediste ---
+% Definición de taps (delays en segundos y potencias en dB)
+tapDelays_s = [0, 0, T_CP];               % segundos (dos componentes en 0 us)
+tapPowers_dB = [-0.394, -10.618, -23.373];     % dB (primeros dos en mismo retardo: LOS + scatter)
+% Doppler especificado en ppm -> convertir a Hz
+maxDopplerHz = 0.91e-6 * fc;                   % 0.91 ppm * fc
+dopplerRate_ppm_per_s = 0.009;                 % 0.009 ppm/s (si se desea usar)
+dopplerRateHz_per_s = dopplerRate_ppm_per_s * 1e-6 * fc;
+
+% --- Construcción del primer tap como Rician (LOS + scatter en mismo retardo) ---
+% Potencias lineales
+P_LOS_lin = 10^(tapPowers_dB(1)/10);      % potencia lineal del LOS
+P_scatter_lin = 10^(tapPowers_dB(2)/10);  % potencia lineal del scatter en mismo retardo
+P_total_lin = P_LOS_lin + P_scatter_lin;  % potencia total en ese retardo
+
+% K factor (linear y en dB) para Rician: K = P_los / P_scatter
+K_linear = P_LOS_lin / P_scatter_lin;
+K_dB = 10*log10(K_linear);
+
+% Ganancia promedio (dB) del path Rician (suma de las dos contribuciones)
+avgGain0_dB = 10*log10(P_total_lin);
+
+% Crea channel objects (Communications Toolbox)
+% Rician para el primer retardo (contiene LOS + componente dispersa en ese retardo)
+ricianChan = comm.RicianChannel( ...
+    SampleRate = fsamp, ...
+    PathDelays = 0, ...
+    AveragePathGains = avgGain0_dB, ...
+    KFactor = K_dB, ...
+    MaximumDopplerShift = maxDopplerHz, ...
+    PathGainsOutputPort = false ...
+    );
+
+% Rayleigh para el tap retrasado (1.48124 us)
+rayleighChan = comm.RayleighChannel( ...
+    SampleRate = fsamp, ...
+    PathDelays = 1.48124e-6, ...
+    AveragePathGains = -23.373, ...
+    MaximumDopplerShift = maxDopplerHz, ...
+    PathGainsOutputPort = false ...
+    );
+
+% --- Pasar txOut por ambos canales y sumar (TDL resultante) ---
+% Nota: ambos objetos aplican internamente los retardos especificados; sumando las salidas
+% obtenemos la respuesta compuesta con un tap Rician en 0 y un tap Rayleigh en 1.48124 us.
+
+y_rician = ricianChan(txOut);
+y_rayleigh = rayleighChan(txOut);
+
+% Si tus objetos introducen retrasos de estado (buffer), las señales resultantes
+% estarán alineadas en tiempo respecto al muestreo y la suma es válida.
+
+dopplerOut = y_rician + y_rayleigh;
+
+%% AAA
+
+% Construir chanParams_det con unidades en muestras (ejemplo)
+% chanParams_det.pathDelays = round(tapDelays_s * fsamp);  % samples
+% % define gains consistent with tapPowers_dB
+% chanParams_det.pathGains = sqrt(10.^(tapPowers_dB/10));
+% chanParams_det.pathDopplers = [0,0,0]; % en índices de doppler o como quieras
+% chanParams_det.pathDopplerFreqs = chanParams_det.pathDopplers * (1/(N*T)); % si aplicable
+
+% usar dopplerChannel para generar salida para pilot y para data
+% dopplerOut = dopplerChannel(txOut, fsamp, chanParams_det);
+% luego AWGN y resto del flujo
+
+
+% --- Añadir ruido y continuar con tu flujo ---
+Es = mean(abs(pskmod(0:3,4,pi/4).^2));
+n0 = Es/(10^(SNRdB/10));
+chOut = awgn(dopplerOut,SNRdB,'measured');
+
+% Información por pantalla (aprox. retardos y doppler)
+fprintf('TDL channel configuration:\n');
+fprintf('\tMax Doppler (Hz) = %.3f\n', maxDopplerHz);
+fprintf('\tDoppler rate (Hz/s) = %.6f\n', dopplerRateHz_per_s);
+fprintf('\tTap delays (s) = [%g, %g, %g]\n', tapDelays_s);
+fprintf('\tTap powers (dB) = [%g, %g, %g]\n', tapPowers_dB);
+
+%% AAA
+
+% Get a sample window
+rxIn = chOut(1:numSamps);
+
+% OTFS demodulation
+Ydd = helperOTFSdemod(rxIn,M,padLen,0,padType);
+
+% LMMSE channel estimate in the delay-Doppler domain
+% En si, es la estimación del canal, pero desplazado 
+% por el piloto, luego se centra en el piloto para obtener
+% la respuesta absoluta del canal
+Hdd = Ydd * conj(Pdd(1,pilotBin)) / (abs(Pdd(1,pilotBin))^2 + n0);
+
+figure;
+xa = 0:1:N-1;
+ya = 0:1:M-1;
+mesh(xa,ya,abs(Hdd));
+view([-9.441 62.412]);
+title('Delay-Doppler Channel Response H_{dd} from Channel Sounding');
+xlabel('Normalized Doppler');
+ylabel('Normalized Delay');
+zlabel('Magnitude');
+
+
+%% AAA
+
+[lp,vp] = find(abs(Hdd) >= 0.05);
+idx = sub2ind(size(Hdd), lp, vp);
+chanEst.pathGains = Hdd(idx);           % get path gains
+chanEst.pathDelays = lp - 1;            % get delay indices
+chanEst.pathDopplers = vp - pilotBin;   % get Doppler indices
+
+%% AAA
+
+% Data generation
+Xgrid = zeros(M,N);
+Xdata = randi([0,1],2*M,N);
+Xgrid(1:M,:) = pskmod(Xdata,4,pi/4,InputType="bit");
+
+% OTFS modulation
+txOut = helperOTFSmod(Xgrid,padLen,padType);
+
+% Add channel and noise
+% --- Pasar txOut por ambos canales y sumar (TDL resultante) ---
+% Nota: ambos objetos aplican internamente los retardos especificados; sumando las salidas
+% obtenemos la respuesta compuesta con un tap Rician en 0 y un tap Rayleigh en 1.48124 us.
+reset(ricianChan);
+reset(rayleighChan);
+
+y_rician = ricianChan(txOut);
+y_rayleigh = rayleighChan(txOut);
+
+% Si tus objetos introducen retrasos de estado (buffer), las señales resultantes
+% estarán alineadas en tiempo respecto al muestreo y la suma es válida.
+
+dopplerOut = y_rician + y_rayleigh;
+
+% usar dopplerChannel para generar salida para pilot y para data
+
+%dopplerOut = dopplerChannel(txOut, fsamp, chanParams_det);
+% luego AWGN y resto del flujo
+
+chOut = awgn(dopplerOut,SNRdB,'measured');
+
+% Form G matrix using channel estimates
+G = getG(M,N,chanEst,padLen,padType);
+
+rxWindow = chOut(1:numSamps);
+y_otfs = ((G'*G)+n0*eye(Meff*N)) \ (G'*rxWindow); % LMMSE
+
+Xhat_otfs = helperOTFSdemod(y_otfs,M,padLen,0,padType); % OTFS demodulation
+
+%% AAA
+
+constDiagOTFS = comm.ConstellationDiagram( ...
+    ReferenceConstellation=pskmod(0:3,4,pi/4), ...
+    AxesLimits=[-2 2], ...
+    Title='OTFS with Time-Domain LMMSE Equalization');
+constDiagOTFS(Xhat_otfs(:));
+
+XhatDataOTFS = pskdemod(Xhat_otfs,4,pi/4,OutputType="bit",OutputDataType="logical");
+[~,berOTFS] = biterr(Xdata,XhatDataOTFS);
+fprintf('OTFS BER with LMMSE equalization = %3.3e\n', berOTFS);
+
+%% AUX functions
+
+
+
+function G = getG(M,N,chanParams,padLen,padType)
+% getG  Construye la matriz de canal en dominio tiempo para OTFS (robusta ante CP insuficiente).
+%   G = getG(M,N,chanParams,padLen,padType)
+%
+% - Para ZP: se asume lmax = padLen (retardos fuera de padLen se descartan).
+% - Para CP: se permite lmax = max(pathDelays) (se emite warning si padLen < lmax porque hay ISI).
+%
+% chanParams must contain fields:
+%   pathDelays (vector), pathGains (vector), pathDopplers (vector)
+%
+% Notas: los pathDelays deben estar en unidades de muestras (enteros). Si vienen en otra unidad,
+% conviértelos antes de llamar a getG.
+
+    % ---- Preparación y saneamiento ----
+    if ~isfield(chanParams,'pathDelays') || isempty(chanParams.pathDelays)
+        warning('getG:NoDelays','chanParams.pathDelays vacío o ausente. Devuelvo G=zeros.');
+        Meff = M + padLen;
+        MN = Meff * N;
+        G = zeros(MN, MN);
+        return;
+    end
+
+    % Asegurar vectores columna y longitudes consistentes
+    delays = chanParams.pathDelays(:);
+    if isfield(chanParams,'pathGains'), gains = chanParams.pathGains(:); else gains = zeros(size(delays)); end
+    if isfield(chanParams,'pathDopplers'), dopplers = chanParams.pathDopplers(:); else dopplers = zeros(size(delays)); end
+
+    % Forzar enteros y no-negativos (si vienen con fracciones)
+    delays = round(delays);
+    delays(delays < 0) = 0;
+
+    % Decide Meff y lmax según padType
+    Meff = M + padLen;  % siempre se usa esta definición para el tamaño de símbolo con padding
+    if strcmpi(padType,'ZP')
+        lmax = padLen;
+    elseif strcmpi(padType,'CP')
+        % Para CP: dimensionar g para cubrir todos los delays detectados.
+        lmax = max(delays);
+        if lmax > padLen
+            warning('getG:CP_insufficient', ...
+                'padLen (%d) < max(pathDelays) (%d). El CP es insuficiente: habrá ISI y pérdida de circularidad. Se construirá G considerando los delays reales.', ...
+                padLen, lmax);
+        end
+    else
+        % Otros: tomar lmax según maximum de delays
+        lmax = max(delays);
+    end
+
+    % Definir tamaños
+    MN = Meff * N;
+    P = numel(delays);
+
+    % Evitar delays absurdos mayores o iguales a MN (no tiene sentido indexar)
+    tooLarge = delays >= MN;
+    if any(tooLarge)
+        warning('getG:DelaysTooLarge','Se descartaron %d delay(s) >= MN (%d).', sum(tooLarge), MN);
+        delays(tooLarge) = []; gains(tooLarge) = []; dopplers(tooLarge) = [];
+        if isempty(delays)
+            G = zeros(MN, MN);
+            return;
+        end
+        lmax = max(lmax, max(delays)); % recomputar por si cambió
+    end
+
+    % Inicializa g: filas = 0..lmax, columnas = 0..MN-1
+    g = zeros(lmax+1, MN);
+
+    % ---- Acumulación de contribuciones de cada path (solo paths válidos) ----
+    nvec = 0:(MN-1);
+    for p = 1:numel(delays)
+        lp = delays(p);
+        % comprobar rango
+        if lp > lmax || lp < 0
+            continue; % debería no ocurrir por saneamiento previo
+        end
+        gp = gains(p);
+        vp = dopplers(p);
+
+        % vector de fase y ganancia para ese retardo
+        % uso la misma fórmula que en tu versión original
+        phaseVec = exp(1i * 2*pi/MN * vp .* (nvec - lp));
+        g(lp+1, :) = g(lp+1, :) + gp .* phaseVec;
+    end
+
+    % ---- Construcción de la matriz G (MN x MN) sumando diagonales desplazadas ----
+    G = zeros(MN, MN);
+
+    uniqueDelays = unique(delays);
+    for l = uniqueDelays.'
+        if l < 0
+            continue;
+        end
+        startIdx = l + 1;
+        if startIdx > size(g,1)
+            % no hay fila correspondiente (por seguridad)
+            continue;
+        end
+        vec = g(startIdx, startIdx:end); % longitud MN - l
+        if isempty(vec)
+            continue;
+        end
+        % diag(vec,-l) coloca el vector en la diagonal desplazada -l (hacia abajo)
+        G = G + diag(vec, -l);
+    end
+
+    % Nota: si padType es 'CP' y padLen < max(delay) -> G modela ISI (no circularidad).
+end
+
+function y = dopplerChannel(x,fs,chanParams)
+    % Form an output vector y comprising paths of x with different
+    % delays, Dopplers, and complex gains
+    numPaths = length(chanParams.pathDelays);
+    maxPathDelay = max(chanParams.pathDelays);
+    txOutSize = length(x);
+
+    y = zeros(txOutSize+maxPathDelay,1);
+
+    for k = 1:numPaths
+        pathOut = zeros(txOutSize+maxPathDelay,1);
+
+        % Doppler
+        pathShift = frequencyOffset(x,fs,chanParams.pathDopplerFreqs(k));
+
+        % Delay and gain
+        pathOut(1+chanParams.pathDelays(k):chanParams.pathDelays(k)+txOutSize) = ...
+            pathShift * chanParams.pathGains(k);
+
+        y = y + pathOut;
+    end
+end
+
+% function G = getG(M,N,chanParams,padLen,padType)
+%     % Form time domain channel matrix from detected DD paths
+%     if strcmp(padType,'ZP') || strcmp(padType,'CP')
+%         Meff = M + padLen;  % account for subsymbol pad length in forming channel
+%         lmax = padLen;      % max delay
+%     else
+%         Meff = M;
+%         lmax = max(chanParams.pathDelays);  % max delay
+%     end
+%     MN = Meff*N;
+%     P = length(chanParams.pathDelays);  % number of paths
+% 
+%     % Form an array of channel responses for each path
+%     g = zeros(lmax+1,MN);
+%     for p = 1:P
+%         gp = chanParams.pathGains(p);
+%         lp = chanParams.pathDelays(p);
+%         vp = chanParams.pathDopplers(p); 
+% 
+%         % For each DD path, compute the channel response.
+%         % Each path is a complex sinusoid at the Doppler frequency (kp)
+%         % shifted by a delay (lp) and scaled by the path gain (gp)
+%         g(lp+1,:) = g(lp+1,:) + gp*exp(1i*2*pi/MN * vp*((0:MN-1)-lp));
+%     end    
+% 
+%     % Form the MN-by-MN channel matrix G
+%     G = zeros(MN,MN);
+%     % Each DD path is a diagonal in G offset by its path delay l
+%     for l = unique(chanParams.pathDelays).'
+%         G = G + diag(g(l+1,l+1:end),-l);
+%     end
+% end
